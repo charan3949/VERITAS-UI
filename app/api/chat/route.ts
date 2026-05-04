@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+export const runtime = "nodejs";
+
 type Source = {
   title: string;
   url: string;
@@ -12,7 +14,18 @@ type Claim = {
   status: "Supported" | "Contradicted" | "Uncertain" | "Unverified" | "Error";
 };
 
+/*
+VeritasAI Core Flow:
+1. Receive user query from frontend
+2. Retrieve external evidence using Tavily
+3. Send query + evidence to Groq LLM
+4. Extract claims from generated answer
+5. Verify claims against retrieved sources
+6. Return answer, sources, claim labels, and trust score
+*/
+
 function extractClaims(answer: string): string[] {
+  // Split the generated answer into meaningful factual claims
   return answer
     .split(/[.!?]\s+/)
     .map((s) => s.trim())
@@ -21,6 +34,7 @@ function extractClaims(answer: string): string[] {
 }
 
 function keywordSupport(claim: string, sources: Source[]) {
+  // Compare important words from a claim with retrieved source content
   const claimWords = claim
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, "")
@@ -37,6 +51,7 @@ function keywordSupport(claim: string, sources: Source[]) {
 }
 
 function detectPossibleContradiction(claim: string, sources: Source[]) {
+  // Lightweight contradiction hint based on negative evidence terms
   const negativeWords = [
     "not confirmed",
     "no evidence",
@@ -59,6 +74,7 @@ function detectPossibleContradiction(claim: string, sources: Source[]) {
 
 export async function POST(req: Request) {
   try {
+    // Receive message and selected mode from frontend
     const { message, mode = "verified" } = await req.json();
 
     const groqKey = process.env.GROQ_API_KEY;
@@ -82,6 +98,7 @@ export async function POST(req: Request) {
     let sources: Source[] = [];
     let context = "";
 
+    // Retrieval step: use Tavily only in Verified/Audit modes
     if (mode !== "chat" && tavilyKey) {
       try {
         const tavilyRes = await fetch("https://api.tavily.com/search", {
@@ -110,10 +127,13 @@ export async function POST(req: Request) {
             content: s.content || "",
           })) || [];
 
+        // Convert retrieved sources into context for the LLM
         context = sources
           .map(
             (s, i) =>
-              `Source ${i + 1}: ${s.title}\nDomain: ${s.domain}\nContent: ${s.content}\nURL: ${s.url}`
+              `Source ${i + 1}: ${s.title}\nDomain: ${s.domain}\nContent: ${
+                s.content
+              }\nURL: ${s.url}`
           )
           .join("\n\n");
       } catch {
@@ -122,6 +142,7 @@ export async function POST(req: Request) {
       }
     }
 
+    // Prompt grounding: instruct LLM to use evidence and avoid unsupported claims
     const prompt =
       mode === "chat"
         ? message
@@ -139,6 +160,7 @@ ${context || "No external evidence retrieved."}
 User question:
 ${message}`;
 
+    // LLM generation step using Groq
     const groqRes = await fetch(
       "https://api.groq.com/openai/v1/chat/completions",
       {
@@ -186,8 +208,10 @@ ${message}`;
     const reply =
       groqData.choices?.[0]?.message?.content || "No response generated.";
 
+    // Claim extraction step
     const extractedClaims = extractClaims(reply);
 
+    // Verification step: label each claim based on retrieved source support
     const verifiedClaims: Claim[] = extractedClaims.map((claim) => {
       if (mode === "chat") {
         return { text: claim, status: "Unverified" };
@@ -223,6 +247,7 @@ ${message}`;
       (c) => c.status === "Uncertain"
     ).length;
 
+    // Trust score: source coverage + claim support - uncertainty/contradiction penalty
     const sourceScore = Math.min(sources.length * 8, 40);
 
     const claimScore =
@@ -241,6 +266,7 @@ ${message}`;
             Math.min(95, 30 + sourceScore + claimScore + auditBonus - penalty)
           );
 
+    // Return structured response to frontend
     return NextResponse.json({
       reply,
       trust,
@@ -262,7 +288,7 @@ ${message}`;
         domain: s.domain,
       })),
     });
-  } catch (error) {
+  } catch {
     return NextResponse.json({
       reply: "Backend error. Please check deployment logs and API keys.",
       trust: 20,
